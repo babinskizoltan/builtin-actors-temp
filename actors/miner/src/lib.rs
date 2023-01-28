@@ -4176,7 +4176,11 @@ fn request_terminate_deals(
     const MAX_LENGTH: usize = 8192;
 
     for chunk in deal_ids.chunks(MAX_LENGTH) {
-        rt.send(
+        // Intentionally swallow this error to prevent frozen market cron corruption from
+        // also freezing this miner cron.
+        // This is safe from a malicious caller perspective because this method's callstack
+        // should always originate with the trusted system caller.
+        _ = rt.send(
             &STORAGE_MARKET_ACTOR_ADDR,
             ext::market::ON_MINER_SECTORS_TERMINATE_METHOD,
             IpldBlock::serialize_cbor(&ext::market::OnMinerSectorsTerminateParamsRef {
@@ -4184,7 +4188,7 @@ fn request_terminate_deals(
                 deal_ids: chunk,
             })?,
             TokenAmount::zero(),
-        )?;
+        );
     }
 
     Ok(())
