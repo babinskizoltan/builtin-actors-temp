@@ -37,6 +37,7 @@ use fil_actors_runtime::{
 };
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::RawBytes;
+use fvm_shared::sys::SendFlags;
 
 use crate::ext::verifreg::{AllocationID, AllocationRequest};
 
@@ -1308,7 +1309,7 @@ fn deal_proposal_is_internally_valid(
     // Generate unsigned bytes
     let proposal_bytes = serialize(&proposal.proposal, "deal proposal")?;
 
-    extract_send_result(rt.send_simple(
+    extract_send_result(rt.send(
         &proposal.proposal.client,
         ext::account::AUTHENTICATE_MESSAGE_METHOD,
         IpldBlock::serialize_cbor(&ext::account::AuthenticateMessageParams {
@@ -1316,6 +1317,8 @@ fn deal_proposal_is_internally_valid(
             message: proposal_bytes.to_vec(),
         })?,
         TokenAmount::zero(),
+        None,
+        SendFlags::READ_ONLY,
     ))
     .map_err(|e| e.wrap("proposal authentication failed"))?;
     Ok(())
