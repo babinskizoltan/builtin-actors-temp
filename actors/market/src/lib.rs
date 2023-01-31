@@ -234,16 +234,34 @@ impl Actor {
             ));
         }
 
+        struct CheckedDeal {
+            proposal: DealProposal,
+            check_passed: bool,
+        }
+        // Deals that passed `AuthenticateMessage` and other state-less checks.
+        let mut checked_deals: Vec<CheckedDeal> = Vec::with_capacity(params.deals.len());
+
         let baseline_power = request_current_baseline_power(rt)?;
         let (network_raw_power, _) = request_current_network_power(rt)?;
+
+        for (di, deal) in params.deals.into_iter().enumerate() {
+            let mut check_passed = true;
+            if let Err(e) = validate_deal(rt, &deal, &network_raw_power, &baseline_power) {
+                info!("invalid deal {}: {}", di, e);
+                check_passed = false;
+            }
+
+            checked_deals.push(CheckedDeal { proposal: deal.proposal, check_passed });
+        }
 
         struct ValidDeal {
             proposal: DealProposal,
             serialized_proposal: RawBytes,
             cid: Cid,
         }
+
         // Deals that passed validation.
-        let mut valid_deals: Vec<ValidDeal> = Vec::with_capacity(params.deals.len());
+        let mut valid_deals: Vec<ValidDeal> = Vec::with_capacity(checked_deals.len());
         // CIDs of valid proposals.
         let mut proposal_cid_lookup = BTreeSet::new();
         let mut total_client_lockup: BTreeMap<ActorID, TokenAmount> = BTreeMap::new();
@@ -259,27 +277,25 @@ impl Actor {
 
         let state: State = rt.state()?;
 
-        for (di, mut deal) in params.deals.into_iter().enumerate() {
-            if let Err(e) = validate_deal(rt, &deal, &network_raw_power, &baseline_power) {
-                info!("invalid deal {}: {}", di, e);
+        for (di, checked_deal) in checked_deals.into_iter().enumerate() {
+            if !checked_deal.check_passed {
                 continue;
             }
 
-            if deal.proposal.provider != Address::new_id(provider_id)
-                && deal.proposal.provider != provider_raw
-            {
+            let mut deal = checked_deal.proposal;
+            if deal.provider != Address::new_id(provider_id) && deal.provider != provider_raw {
                 info!(
                     "invalid deal {}: cannot publish deals from multiple providers in one batch",
                     di
                 );
                 continue;
             }
-            let client_id = match rt.resolve_address(&deal.proposal.client) {
+            let client_id = match rt.resolve_address(&deal.client) {
                 Some(client) => client,
                 _ => {
                     info!(
                         "invalid deal {}: failed to resolve proposal.client address {} for deal",
-                        di, deal.proposal.client
+                        di, deal.client
                     );
                     continue;
                 }
@@ -288,7 +304,7 @@ impl Actor {
             // drop deals with insufficient lock up to cover costs
             let mut client_lockup =
                 total_client_lockup.get(&client_id).cloned().unwrap_or_default();
-            client_lockup += deal.proposal.client_balance_requirement();
+            client_lockup += deal.client_balance_requirement();
 
             let client_balance_ok =
                 state.balance_covered(rt.store(), Address::new_id(client_id), &client_lockup)?;
@@ -299,7 +315,7 @@ impl Actor {
             }
 
             let mut provider_lockup = total_provider_lockup.clone();
-            provider_lockup += &deal.proposal.provider_collateral;
+            provider_lockup += &deal.provider_collateral;
             let provider_balance_ok = state.balance_covered(
                 rt.store(),
                 Address::new_id(provider_id),
@@ -314,10 +330,10 @@ impl Actor {
             // drop duplicate deals
             // Normalise provider and client addresses in the proposal stored on chain.
             // Must happen after signature verification and before taking cid.
-            deal.proposal.provider = Address::new_id(provider_id);
-            deal.proposal.client = Address::new_id(client_id);
+            deal.provider = Address::new_id(provider_id);
+            deal.client = Address::new_id(client_id);
 
-            let serialized_proposal = serialize(&deal.proposal, "normalized deal proposal")
+            let serialized_proposal = serialize(&deal, "normalized deal proposal")
                 .context_code(ExitCode::USR_SERIALIZATION, "failed to serialize")?;
             let pcid = rt_serialized_deal_cid(rt, &serialized_proposal).map_err(
                 |e| actor_error!(illegal_argument; "failed to take cid of proposal {}: {}", di, e),
@@ -336,7 +352,7 @@ impl Actor {
             // Fetch each client's datacap balance and calculate the amount of datacap required for
             // each client's verified deals.
             // Drop any verified deals for which the client has insufficient datacap.
-            if deal.proposal.verified_deal {
+            if deal.verified_deal {
                 let remaining_datacap = match client_datacap_remaining.get(&client_id).cloned() {
                     None => balance_of(rt, &Address::new_id(client_id))
                         .with_context_code(ExitCode::USR_NOT_FOUND, || {
@@ -344,8 +360,7 @@ impl Actor {
                         })?,
                     Some(client_data) => client_data,
                 };
-                let piece_datacap_required =
-                    TokenAmount::from_whole(deal.proposal.piece_size.0 as i64);
+                let piece_datacap_required = TokenAmount::from_whole(deal.piece_size.0 as i64);
                 if remaining_datacap < piece_datacap_required {
                     client_datacap_remaining.insert(client_id, remaining_datacap);
                     continue; // Drop the deal
@@ -361,7 +376,7 @@ impl Actor {
             total_provider_lockup = provider_lockup;
             total_client_lockup.insert(client_id, client_lockup);
             proposal_cid_lookup.insert(pcid);
-            valid_deals.push(ValidDeal { proposal: deal.proposal, serialized_proposal, cid: pcid });
+            valid_deals.push(ValidDeal { proposal: deal, serialized_proposal, cid: pcid });
             valid_input_bf.set(di as u64)
         }
 
@@ -1083,21 +1098,21 @@ pub fn validate_and_return_deal_space<BS: Blockstore>(
 
 fn alloc_request_for_deal(
     // Deal proposal must have ID addresses
-    deal: &ClientDealProposal,
+    deal: &DealProposal,
     policy: &Policy,
     curr_epoch: ChainEpoch,
 ) -> ext::verifreg::AllocationRequest {
-    let alloc_term_min = deal.proposal.end_epoch - deal.proposal.start_epoch;
+    let alloc_term_min = deal.end_epoch - deal.start_epoch;
     let alloc_term_max = min(
         alloc_term_min + policy.market_default_allocation_term_buffer,
         policy.maximum_verified_allocation_term,
     );
     let alloc_expiration =
-        min(deal.proposal.start_epoch, curr_epoch + policy.maximum_verified_allocation_expiration);
+        min(deal.start_epoch, curr_epoch + policy.maximum_verified_allocation_expiration);
     ext::verifreg::AllocationRequest {
-        provider: deal.proposal.provider.id().unwrap(),
-        data: deal.proposal.piece_cid,
-        size: deal.proposal.piece_size,
+        provider: deal.provider.id().unwrap(),
+        data: deal.piece_cid,
+        size: deal.piece_size,
         term_min: alloc_term_min,
         term_max: alloc_term_max,
         expiration: alloc_expiration,
