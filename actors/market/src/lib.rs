@@ -460,7 +460,7 @@ impl Actor {
             Ok(())
         })?;
 
-        // notify clients ignoring any errors
+        // notify clients, any failures cause the entire publish_storage_deals method to fail
         for (i, valid_deal) in valid_deals.iter().enumerate() {
             _ = extract_send_result(rt.send_simple(
                 &valid_deal.proposal.client,
@@ -470,7 +470,10 @@ impl Actor {
                     deal_id: new_deal_ids[i],
                 })?,
                 TokenAmount::zero(),
-            ));
+            ))
+            .with_context(|| {
+                format!("failed to notify deal with proposal cid {}", valid_deal.cid)
+            })?;
         }
 
         Ok(PublishStorageDealsReturn { ids: new_deal_ids, valid_deals: valid_input_bf })
